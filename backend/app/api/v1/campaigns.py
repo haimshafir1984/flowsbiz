@@ -9,18 +9,34 @@ from app.adapters.database.connection import get_db_session
 from app.adapters.database.models import ClientORM, CampaignORM, MessageORM, AuditLogORM
 from app.adapters.queue.provider import CeleryQueueProvider
 from app.api.schemas import ClientCreateSchema, CampaignCreateSchema
+from app.api.dependencies import admin_required, client_or_admin_required
+from app.core.models.client import User, UserRole
 
 router = APIRouter()
 
-# Client (Tenant) Management
+# --- Client (Tenant) Management (Admins Only) ---
+
 @router.get("/clients")
-async def list_clients(db: AsyncSession = Depends(get_db_session)):
+async def list_clients(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(admin_required)
+):
+    """
+    List all active clients. Restricted to global Admin only.
+    """
     stmt = select(ClientORM).order_by(ClientORM.created_at.desc())
     res = await db.execute(stmt)
     return res.scalars().all()
 
 @router.post("/clients", status_code=201)
-async def create_client(payload: ClientCreateSchema, db: AsyncSession = Depends(get_db_session)):
+async def create_client(
+    payload: ClientCreateSchema, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(admin_required)
+):
+    """
+    Create a new client/tenant. Restricted to global Admin only.
+    """
     client = ClientORM(
         id=uuid4(),
         name=payload.name,
@@ -36,9 +52,37 @@ async def create_client(payload: ClientCreateSchema, db: AsyncSession = Depends(
     await db.refresh(client)
     return client
 
-# Campaigns Management
+# --- Global Security Audit Log (Admins Only) ---
+
+@router.get("/global/audits")
+async def get_global_audits(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(admin_required)
+):
+    """
+    Fetch global audit logs across all clients. Restricted to global Admin only.
+    """
+    stmt = select(AuditLogORM).order_by(AuditLogORM.timestamp.desc())
+    res = await db.execute(stmt)
+    return res.scalars().all()
+
+# --- Scoped Campaigns & Logs Management ---
+
 @router.get("/{client_id}")
-async def list_campaigns(client_id: UUID, db: AsyncSession = Depends(get_db_session)):
+async def list_campaigns(
+    client_id: UUID, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
+):
+    """
+    List campaigns for a specific client. Ensures client isolation.
+    """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot query other tenants' campaigns."
+        )
+        
     stmt = select(CampaignORM).where(CampaignORM.client_id == client_id).order_by(CampaignORM.started_at.desc())
     res = await db.execute(stmt)
     return res.scalars().all()
@@ -47,8 +91,18 @@ async def list_campaigns(client_id: UUID, db: AsyncSession = Depends(get_db_sess
 async def create_campaign(
     client_id: UUID, 
     payload: CampaignCreateSchema, 
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
 ):
+    """
+    Create a new campaign. Ensures tenant validation.
+    """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot create campaigns for other tenants."
+        )
+        
     campaign = CampaignORM(
         id=uuid4(),
         client_id=client_id,
@@ -63,15 +117,27 @@ async def create_campaign(
     await db.refresh(campaign)
     return campaign
 
-# Flow A - Campaign Dispatch Trigger
 @router.post("/{campaign_id}/dispatch")
-async def dispatch_campaign(campaign_id: UUID, db: AsyncSession = Depends(get_db_session)):
+async def dispatch_campaign(
+    campaign_id: UUID, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
+):
+    """
+    Dispatch campaign messages. Handles tenant-level validations.
+    """
     stmt = select(CampaignORM).where(CampaignORM.id == campaign_id)
     res = await db.execute(stmt)
     campaign = res.scalar_one_or_none()
     
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    if current_user.role == UserRole.CLIENT and campaign.client_id != current_user.client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: This campaign does not belong to your account."
+        )
         
     if campaign.status in ("processing", "completed"):
         raise HTTPException(status_code=400, detail="Campaign is already processing or completed")
@@ -95,21 +161,47 @@ async def dispatch_campaign(campaign_id: UUID, db: AsyncSession = Depends(get_db
     
     return {"message": "Campaign queued and scheduled for background execution", "status": "scheduled"}
 
-# Metrics Logging and Auditing
 @router.get("/{campaign_id}/messages")
-async def get_campaign_messages(campaign_id: UUID, db: AsyncSession = Depends(get_db_session)):
+async def get_campaign_messages(
+    campaign_id: UUID, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
+):
     """
-    Fetch granular dispatch tracking logs for a campaign.
+    Fetch granular dispatch tracking logs for a campaign. Ensures tenant isolation.
     """
+    stmt = select(CampaignORM).where(CampaignORM.id == campaign_id)
+    res = await db.execute(stmt)
+    campaign = res.scalar_one_or_none()
+    
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+        
+    if current_user.role == UserRole.CLIENT and campaign.client_id != current_user.client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: This campaign does not belong to your account."
+        )
+        
     stmt = select(MessageORM).where(MessageORM.campaign_id == campaign_id).order_by(MessageORM.sent_at.desc())
     res = await db.execute(stmt)
     return res.scalars().all()
 
 @router.get("/{client_id}/audits")
-async def get_client_audits(client_id: UUID, db: AsyncSession = Depends(get_db_session)):
+async def get_client_audits(
+    client_id: UUID, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
+):
     """
-    Fetch tenant audit trails.
+    Fetch tenant audit trails. Ensures tenant isolation.
     """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot fetch other tenants' audit logs."
+        )
+        
     stmt = select(AuditLogORM).where(AuditLogORM.client_id == client_id).order_by(AuditLogORM.timestamp.desc())
     res = await db.execute(stmt)
     return res.scalars().all()

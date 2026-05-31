@@ -61,8 +61,11 @@ interface AuditLog {
 }
 
 function App() {
-  // Navigation
-  const [activeMenu, setActiveMenu] = useState<'tenants' | 'contacts' | 'campaigns' | 'simulator' | 'userView'>('campaigns');
+  // SaaS Auth Role Selection ('ADMIN' or 'CLIENT')
+  const [role, setRole] = useState<'ADMIN' | 'CLIENT'>('ADMIN');
+  
+  // Navigation Menu (changes based on active role)
+  const [activeMenu, setActiveMenu] = useState<'tenants' | 'contacts' | 'campaigns' | 'simulator' | 'userView' | 'globalAudits'>('campaigns');
 
   // Multi-Tenant context selection
   const [clients, setClients] = useState<Client[]>([]);
@@ -74,6 +77,7 @@ function App() {
   const [selectedCampaignMessages, setSelectedCampaignMessages] = useState<MessageLog[]>([]);
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [audits, setAudits] = useState<AuditLog[]>([]);
+  const [globalAudits, setGlobalAudits] = useState<AuditLog[]>([]);
 
   // Connectivity indicators
   const [backendStatus, setBackendStatus] = useState<'live' | 'checking' | 'offline'>('checking');
@@ -112,6 +116,15 @@ function App() {
   const [selectedCsvFile, setSelectedCsvFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
+  // Helper to build headers with active SaaS Role context
+  const getAuthHeaders = (extraHeaders: Record<string, string> = {}) => {
+    return {
+      'X-User-Role': role,
+      'X-Client-Id': activeClient?.id || '',
+      ...extraHeaders
+    };
+  };
+
   // Auto-select first contact for simulation context
   useEffect(() => {
     if (contacts.length > 0 && !simulatedContact) {
@@ -132,6 +145,15 @@ function App() {
     }
   }, [simulatedContact, activeClient]);
 
+  // Reset menu mapping when switching role to prevent viewing forbidden tabs
+  useEffect(() => {
+    if (role === 'CLIENT') {
+      if (activeMenu === 'tenants' || activeMenu === 'globalAudits' || activeMenu === 'simulator') {
+        setActiveMenu('campaigns');
+      }
+    }
+  }, [role, activeMenu]);
+
   const handleSendSimulatedChat = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInputText.trim() || !simulatedContact || !activeClient) return;
@@ -146,7 +168,7 @@ function App() {
     if (userText === 'הסר' || userText === 'להסיר' || userText.toLowerCase() === 'unsubscribe') {
       setIsLoading(true);
       try {
-        // Trigger simulation endpoint on the backend
+        // Trigger simulation endpoint on the backend (Webhooks don't need auth headers - mimics Facebook API call)
         const res = await fetch(`/api/v1/webhooks/simulate-webhook?event_type=user_unsubscribe&phone_number=${encodeURIComponent(simulatedContact.phone_number)}`, {
           method: 'POST'
         });
@@ -197,7 +219,9 @@ function App() {
 
   const fetchClients = async () => {
     try {
-      const res = await fetch('/api/v1/campaigns/clients');
+      const res = await fetch('/api/v1/campaigns/clients', {
+        headers: getAuthHeaders()
+      });
       if (res.ok) {
         const data = await res.json();
         setClients(data);
@@ -210,28 +234,54 @@ function App() {
     }
   };
 
+  const fetchGlobalAudits = async () => {
+    if (role !== 'ADMIN') return;
+    try {
+      const res = await fetch('/api/v1/campaigns/global/audits', {
+        headers: getAuthHeaders()
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setGlobalAudits(data);
+      }
+    } catch (err) {
+      console.error('Failed to fetch global audits:', err);
+    }
+  };
+
   const fetchTenantData = async () => {
     if (!activeClient) return;
     try {
       // Fetch Campaigns
-      const campRes = await fetch(`/api/v1/campaigns/${activeClient.id}`);
+      const campRes = await fetch(`/api/v1/campaigns/${activeClient.id}`, {
+        headers: getAuthHeaders()
+      });
       if (campRes.ok) {
         const campData = await campRes.json();
         setCampaigns(campData);
       }
 
       // Fetch Contacts
-      const contRes = await fetch(`/api/v1/contacts/${activeClient.id}`);
+      const contRes = await fetch(`/api/v1/contacts/${activeClient.id}`, {
+        headers: getAuthHeaders()
+      });
       if (contRes.ok) {
         const contData = await contRes.json();
         setContacts(contData);
       }
 
       // Fetch Audit logs
-      const auditRes = await fetch(`/api/v1/campaigns/${activeClient.id}/audits`);
+      const auditRes = await fetch(`/api/v1/campaigns/${activeClient.id}/audits`, {
+        headers: getAuthHeaders()
+      });
       if (auditRes.ok) {
         const auditData = await auditRes.json();
         setAudits(auditData);
+      }
+
+      // Fetch global logs if in admin role context
+      if (role === 'ADMIN') {
+        fetchGlobalAudits();
       }
     } catch (err) {
       console.error('Failed to fetch tenant data:', err);
@@ -242,13 +292,22 @@ function App() {
     checkHealth();
   }, []);
 
+  // Re-fetch data whenever the active client context OR user role switches
   useEffect(() => {
     if (activeClient) {
       fetchTenantData();
       setSelectedCampaign(null);
       setSelectedCampaignMessages([]);
     }
-  }, [activeClient]);
+  }, [activeClient, role]);
+
+  // Load clients lists for Admin whenever role switches back to Admin
+  useEffect(() => {
+    if (role === 'ADMIN') {
+      fetchClients();
+      fetchGlobalAudits();
+    }
+  }, [role]);
 
   const handleCreateClient = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -257,7 +316,7 @@ function App() {
     try {
       const res = await fetch('/api/v1/campaigns/clients', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           name: clientName,
           company_registration_number: clientRegNum || 'N/A',
@@ -279,7 +338,8 @@ function App() {
         setAccessToken('');
         showStatus('success', 'לקוח חדש נוצר והוגדר בהצלחה!');
       } else {
-        throw new Error();
+        const err = await res.json();
+        showStatus('error', err.detail || 'שגיאה ביצירת הלקוח. בדוק קלט ונסה שוב.');
       }
     } catch {
       showStatus('error', 'שגיאה ביצירת הלקוח. בדוק קלט ונסה שוב.');
@@ -304,7 +364,7 @@ function App() {
     try {
       const res = await fetch(`/api/v1/contacts/${activeClient.id}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           phone_number: contactPhone,
           first_name: contactFirst,
@@ -329,7 +389,8 @@ function App() {
         setContactLast('');
         showStatus('success', 'איש קשר נוסף ונקלט בהצלחה!');
       } else {
-        throw new Error();
+        const err = await res.json();
+        showStatus('error', err.detail || 'שגיאה בקליטת איש הקשר');
       }
     } catch {
       showStatus('error', 'שגיאה בקליטת איש הקשר');
@@ -349,6 +410,7 @@ function App() {
     try {
       const res = await fetch(`/api/v1/contacts/upload/${activeClient.id}`, {
         method: 'POST',
+        headers: getAuthHeaders(), // Will append X-User-Role and X-Client-Id
         body: formData
       });
 
@@ -373,11 +435,19 @@ function App() {
     const nextStatus = currentStatus === 'granted' ? 'revoked' : 'granted';
     try {
       const res = await fetch(`/api/v1/contacts/${contactId}/opt-status?opt_status=${nextStatus}`, {
-        method: 'PUT'
+        method: 'PUT',
+        headers: getAuthHeaders()
       });
       if (res.ok) {
         setContacts(prev => prev.map(c => c.id === contactId ? { ...c, opt_in_status: nextStatus as any } : c));
+        // If simulated user view is open for this contact, update its opt-in status immediately too
+        if (simulatedContact && simulatedContact.id === contactId) {
+          setSimulatedContact(prev => prev ? { ...prev, opt_in_status: nextStatus as any } : null);
+        }
         showStatus('success', 'סטטוס אישור דיוור עודכן בהצלחה!');
+      } else {
+        const err = await res.json();
+        showStatus('error', err.detail || 'שגיאה בעדכון הרשאות הדיוור');
       }
     } catch (err) {
       console.error('Failed to toggle opt-in status:', err);
@@ -391,7 +461,7 @@ function App() {
     try {
       const res = await fetch(`/api/v1/campaigns/${activeClient.id}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           client_id: activeClient.id,
           name: campName,
@@ -405,7 +475,8 @@ function App() {
         setCampName('');
         showStatus('success', 'קמפיין חדש נוצר כטיוטה בהצלחה!');
       } else {
-        throw new Error();
+        const err = await res.json();
+        showStatus('error', err.detail || 'שגיאה ביצירת קמפיין חדש');
       }
     } catch {
       showStatus('error', 'שגיאה ביצירת קמפיין חדש');
@@ -418,7 +489,8 @@ function App() {
     setIsLoading(true);
     try {
       const res = await fetch(`/api/v1/campaigns/${campaignId}/dispatch`, {
-        method: 'POST'
+        method: 'POST',
+        headers: getAuthHeaders()
       });
       if (res.ok) {
         showStatus('success', 'הקמפיין נשלח לתור העבודה והחל תהליך השידור!');
@@ -437,7 +509,9 @@ function App() {
   const handleSelectCampaign = async (campaign: Campaign) => {
     setSelectedCampaign(campaign);
     try {
-      const res = await fetch(`/api/v1/campaigns/${campaign.id}/messages`);
+      const res = await fetch(`/api/v1/campaigns/${campaign.id}/messages`, {
+        headers: getAuthHeaders()
+      });
       if (res.ok) {
         const data = await res.json();
         setSelectedCampaignMessages(data);
@@ -452,7 +526,7 @@ function App() {
     setTimeout(() => setStatusMsg(null), 5000);
   };
 
-  // Mock Simulations (Flow B)
+  // Mock Simulations (Flow B - Webhooks don't need auth headers as they mock real Incoming Meta Cloud calls)
   const handleSimulateWebhook = async (type: string, wamid?: string, phone?: string) => {
     setIsLoading(true);
     try {
@@ -484,85 +558,180 @@ function App() {
       <div className="glow-accent-1"></div>
       <div className="glow-accent-2"></div>
 
-      {/* Sidebar (Localized in Hebrew) */}
+      {/* Sidebar (Localized in Hebrew and scoped by Role) */}
       <aside className="sidebar">
         <div>
           <div className="brand-section">
-            <div className="brand-icon">💬</div>
-            <span className="brand-name">מנוע קמפיינים</span>
+            <div className="brand-icon">{role === 'ADMIN' ? '🛡️' : '💬'}</div>
+            <span className="brand-name">
+              {role === 'ADMIN' ? 'ניהול על FlowsBiz' : activeClient?.name || 'פנל לקוח קצה'}
+            </span>
           </div>
 
-          <div style={{ marginBottom: '1.5rem' }}>
-            <label className="form-label" style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>בחר לקוח פעיל (Tenant Context)</label>
-            {clients.length === 0 ? (
-              <p style={{ fontSize: '0.85rem', color: 'var(--color-danger)' }}>טרם הוגדרו לקוחות</p>
-            ) : (
-              <select 
-                className="form-input" 
-                style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', marginTop: '0.35rem' }}
-                value={activeClient?.id || ''}
-                onChange={(e) => {
-                  const target = clients.find(c => c.id === e.target.value);
-                  if (target) setActiveClient(target);
-                }}
-              >
-                {clients.map(c => (
-                  <option key={c.id} value={c.id}>{c.name}</option>
-                ))}
-              </select>
-            )}
-          </div>
+          {/* Admin Role - Client Impersonation Selection Dropdown */}
+          {role === 'ADMIN' && (
+            <div style={{ marginBottom: '1.5rem', background: 'rgba(59, 130, 246, 0.05)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(59, 130, 246, 0.1)' }}>
+              <label className="form-label" style={{ fontSize: '0.75rem', color: 'var(--color-violet)', fontWeight: 600 }}>התחזות ללקוח (Tenant Context)</label>
+              {clients.length === 0 ? (
+                <p style={{ fontSize: '0.85rem', color: 'var(--color-danger)', margin: '0.25rem 0 0 0' }}>טרם הוגדרו לקוחות</p>
+              ) : (
+                <select 
+                  className="form-input" 
+                  style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-color)', marginTop: '0.35rem', fontSize: '0.85rem' }}
+                  value={activeClient?.id || ''}
+                  onChange={(e) => {
+                    const target = clients.find(c => c.id === e.target.value);
+                    if (target) setActiveClient(target);
+                  }}
+                >
+                  {clients.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
+
+          {role === 'CLIENT' && activeClient && (
+            <div style={{ marginBottom: '1.5rem', background: 'rgba(16, 185, 129, 0.05)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(16, 185, 129, 0.1)' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--color-success)', fontWeight: 600, display: 'block' }}>דייר פעיל ומאובטח</span>
+              <strong style={{ fontSize: '0.9rem', color: 'var(--text-bright)', marginTop: '0.25rem', display: 'block' }}>
+                {activeClient.name}
+              </strong>
+              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>מזהה: <code>{activeClient.id.substring(0, 8)}...</code></span>
+            </div>
+          )}
 
           <ul className="nav-menu">
+            {/* 1. Campaigns & Sends Menu (Available to both Admin and Client) */}
             <li 
               className={`nav-item ${activeMenu === 'campaigns' ? 'active' : ''}`}
               onClick={() => setActiveMenu('campaigns')}
             >
               <span className="nav-icon">🚀</span>
-              קמפיינים ושידורים
+              {role === 'ADMIN' ? 'קמפיינים ושידורים' : 'הקמפיינים שלי'}
             </li>
+
+            {/* 2. Contacts Management (Available to both Admin and Client) */}
             <li 
               className={`nav-item ${activeMenu === 'contacts' ? 'active' : ''}`}
               onClick={() => setActiveMenu('contacts')}
             >
               <span className="nav-icon">👥</span>
-              אנשי קשר ואישורי דיוור
+              {role === 'ADMIN' ? 'ניהול אנשי קשר' : 'ייבוא וניהול אנשי קשר'}
             </li>
-            <li 
-              className={`nav-item ${activeMenu === 'tenants' ? 'active' : ''}`}
-              onClick={() => setActiveMenu('tenants')}
-            >
-              <span className="nav-icon">🏢</span>
-              הגדרות לקוחות (SaaS)
-            </li>
+
+            {/* 3. Client Registration/CRUD (ADMIN Role Only) */}
+            {role === 'ADMIN' && (
+              <li 
+                className={`nav-item ${activeMenu === 'tenants' ? 'active' : ''}`}
+                onClick={() => setActiveMenu('tenants')}
+              >
+                <span className="nav-icon">🏢</span>
+                ניהול לקוחות (CRUD)
+              </li>
+            )}
+
+            {/* 4. Global Audit Logs (ADMIN Role Only) */}
+            {role === 'ADMIN' && (
+              <li 
+                className={`nav-item ${activeMenu === 'globalAudits' ? 'active' : ''}`}
+                onClick={() => setActiveMenu('globalAudits')}
+              >
+                <span className="nav-icon">📜</span>
+                לוגי אבטחה גלובליים
+              </li>
+            )}
+
+            {/* 5. Simulated User preference view (Available to both) */}
             <li 
               className={`nav-item ${activeMenu === 'userView' ? 'active' : ''}`}
               onClick={() => setActiveMenu('userView')}
             >
               <span className="nav-icon">📱</span>
-              תצוגת קצה ומובייל (צד המשתמש)
+              {role === 'ADMIN' ? 'סימולטור צד משתמש קצה' : 'תיבת צ\'אט / Inbox מובייל'}
             </li>
-            <li 
-              className={`nav-item ${activeMenu === 'simulator' ? 'active' : ''}`}
-              onClick={() => setActiveMenu('simulator')}
-            >
-              <span className="nav-icon">🛠️</span>
-              סימולטור אירועים (Flow B)
-            </li>
+
+            {/* 6. Webhooks simulator (ADMIN Role Only) */}
+            {role === 'ADMIN' && (
+              <li 
+                className={`nav-item ${activeMenu === 'simulator' ? 'active' : ''}`}
+                onClick={() => setActiveMenu('simulator')}
+              >
+                <span className="nav-icon">🛠️</span>
+                סימולטור אירועים (Flow B)
+              </li>
+            )}
           </ul>
         </div>
 
         <div className="sidebar-footer">
-          <span className="version-pill">ארכיטקטורת Ports & Adapters</span>
+          <span className="version-pill">Multi-Tenancy PWA Engine</span>
         </div>
       </aside>
 
       {/* Main Panel */}
       <main className="main-content">
-        <header className="main-header">
+        <header className="main-header" style={{ flexWrap: 'wrap', gap: '1rem' }}>
           <div className="header-title">
             <h1>ניהול הפצה בוואטסאפ Cloud API</h1>
-            <p>שליטה מלאה בקמפיינים מרובי דיירים, הגנת ספאם (Opt-out/Opt-in) ושידור מבוקר.</p>
+            <p>ארכיטקטורת Ports & Adapters מאובטחת ומבוזרת.</p>
+          </div>
+
+          {/* SIMULATION ROLE SWITCHER CONTROL PANEL (Premium light mode style) */}
+          <div 
+            style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '0.5rem', 
+              background: 'rgba(255,255,255,0.7)', 
+              backdropFilter: 'blur(10px)', 
+              padding: '0.45rem 0.75rem', 
+              borderRadius: '30px', 
+              border: '1px solid var(--border-color)',
+              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)'
+            }}
+          >
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-bright)', fontWeight: 600 }}>סימולציית תפקיד:</span>
+            <button 
+              className="btn" 
+              style={{ 
+                fontSize: '0.75rem', 
+                padding: '0.35rem 0.75rem', 
+                borderRadius: '20px', 
+                border: 'none',
+                background: role === 'ADMIN' ? 'var(--color-violet)' : 'transparent',
+                color: role === 'ADMIN' ? '#ffffff' : 'var(--text-main)',
+                fontWeight: 600,
+                cursor: 'pointer',
+                transition: 'all 0.2s ease'
+              }}
+              onClick={() => setRole('ADMIN')}
+            >
+              🛡️ מנהל (Admin)
+            </button>
+            <button 
+              className="btn" 
+              style={{ 
+                fontSize: '0.75rem', 
+                padding: '0.35rem 0.75rem', 
+                borderRadius: '20px', 
+                border: 'none',
+                background: role === 'CLIENT' ? 'var(--color-success)' : 'transparent',
+                color: role === 'CLIENT' ? '#ffffff' : 'var(--text-main)',
+                fontWeight: 600,
+                cursor: 'pointer',
+                transition: 'all 0.2s ease'
+              }}
+              onClick={() => {
+                if (!activeClient && clients.length > 0) {
+                  setActiveClient(clients[0]);
+                }
+                setRole('CLIENT');
+              }}
+            >
+              💼 לקוח (Client)
+            </button>
           </div>
 
           <div className="status-pill">
@@ -583,7 +752,7 @@ function App() {
             style={{ 
               padding: '1rem', 
               borderColor: statusMsg.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)',
-              background: statusMsg.type === 'success' ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)'
+              background: statusMsg.type === 'success' ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)'
             }}
           >
             <p style={{ fontWeight: 600, color: statusMsg.type === 'success' ? 'var(--color-success)' : 'var(--color-danger)' }}>
@@ -677,7 +846,7 @@ function App() {
                     <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'center', padding: '2rem 0' }}>טרם נוצרו יומני שידור עבור קמפיין זה.</p>
                   ) : (
                     selectedCampaignMessages.map(msg => (
-                      <div key={msg.id} style={{ padding: '0.75rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '0.85rem' }}>
+                      <div key={msg.id} style={{ padding: '0.75rem', background: 'rgba(0,0,0,0.02)', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '0.85rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                           <strong>{msg.phone_number}</strong>
                           <span style={{ 
@@ -694,29 +863,32 @@ function App() {
                           </span>
                         </div>
                         {msg.meta_message_id && (
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', display: 'flex', justifyContent: 'space-between' }}>
+                          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <span>מזהה הודעה: <code>{msg.meta_message_id}</code></span>
-                            {/* Webhook trigger links inside matching list row */}
-                            <div style={{ display: 'flex', gap: '0.35rem' }}>
-                              {msg.status === 'sent' && (
-                                <button 
-                                  className="btn" 
-                                  style={{ fontSize: '0.7rem', padding: '0.1rem 0.3rem', background: 'var(--color-cyan-glow)', color: 'var(--color-cyan)' }}
-                                  onClick={() => handleSimulateWebhook('status_delivered', msg.meta_message_id!)}
-                                >
-                                  סמל מסירה ✔
-                                </button>
-                              )}
-                              {(msg.status === 'sent' || msg.status === 'delivered') && (
-                                <button 
-                                  className="btn" 
-                                  style={{ fontSize: '0.7rem', padding: '0.1rem 0.3rem', background: 'var(--color-success-glow)', color: 'var(--color-success)' }}
-                                  onClick={() => handleSimulateWebhook('status_read', msg.meta_message_id!)}
-                                >
-                                  סמל קריאה 👁
-                                </button>
-                              )}
-                            </div>
+                            
+                            {/* Webhook trigger simulator inside campaign messaging row (Visible only to Admin to keep it clean) */}
+                            {role === 'ADMIN' && (
+                              <div style={{ display: 'flex', gap: '0.35rem' }}>
+                                {msg.status === 'sent' && (
+                                  <button 
+                                    className="btn" 
+                                    style={{ fontSize: '0.7rem', padding: '0.1rem 0.3rem', background: 'var(--color-cyan-glow)', color: 'var(--color-cyan)' }}
+                                    onClick={() => handleSimulateWebhook('status_delivered', msg.meta_message_id!)}
+                                  >
+                                    מסר ✔
+                                  </button>
+                                )}
+                                {(msg.status === 'sent' || msg.status === 'delivered') && (
+                                  <button 
+                                    className="btn" 
+                                    style={{ fontSize: '0.7rem', padding: '0.1rem 0.3rem', background: 'var(--color-success-glow)', color: 'var(--color-success)' }}
+                                    onClick={() => handleSimulateWebhook('status_read', msg.meta_message_id!)}
+                                  >
+                                    קרא 👁
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </div>
                         )}
                         {msg.error_code && (
@@ -911,8 +1083,8 @@ function App() {
           </div>
         )}
 
-        {/* 3. Tenants Configuration Menu */}
-        {activeMenu === 'tenants' && (
+        {/* 3. Tenants Configuration Menu (ADMIN Role Only) */}
+        {activeMenu === 'tenants' && role === 'ADMIN' && (
           <div className="content-grid">
             {/* List clients */}
             <section className="glass-card">
@@ -943,7 +1115,7 @@ function App() {
               )}
             </section>
 
-            {/* Create Client (Tenant Setup) */}
+            {/* Create Client (Tenant Setup Setup) */}
             <section className="glass-card">
               <h2 className="section-title">🏢 רישום דייר/לקוח (Tenant Registration)</h2>
               <form onSubmit={handleCreateClient}>
@@ -1031,8 +1203,53 @@ function App() {
           </div>
         )}
 
-        {/* 4. API & Webhook Simulation Center */}
-        {activeMenu === 'simulator' && (
+        {/* 4. Global Security Audit Logs (ADMIN Role Only) */}
+        {activeMenu === 'globalAudits' && role === 'ADMIN' && (
+          <div className="content-grid" style={{ gridTemplateColumns: '1fr' }}>
+            <section className="glass-card">
+              <h2 className="section-title">🛡️ לוגי אבטחה ומעקב גלובליים (Global SaaS Audits)</h2>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                תצוגה מרוכזת של כלל יומני הפעילות עבור מנהלי מערכת. מציג פעולות יבוא, הסרות דיוור ושידורי קמפיינים בכלל הדיירים.
+              </p>
+              
+              <div className="items-list" style={{ maxHeight: '600px', overflowY: 'auto' }}>
+                {globalAudits.length === 0 ? (
+                  <p style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '3rem 0' }}>טרם נרשמו פעולות מערכת גלובליות.</p>
+                ) : (
+                  globalAudits.map(audit => {
+                    const clientName = clients.find(c => c.id === audit.client_id)?.name || `Client [${audit.client_id.substring(0,8)}]`;
+                    return (
+                      <div key={audit.id} className="item-row" style={{ display: 'block', padding: '1rem', background: 'rgba(0, 0, 0, 0.01)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div>
+                            <span className="version-pill" style={{ background: 'var(--color-violet-glow)', color: 'var(--color-violet)', fontSize: '0.75rem', marginLeft: '0.5rem' }}>
+                              {audit.action}
+                            </span>
+                            <span style={{ fontSize: '0.85rem', color: 'var(--text-bright)', fontWeight: 600 }}>
+                              שם לקוח: {clientName}
+                            </span>
+                          </div>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                            {new Date(audit.timestamp).toLocaleString('he-IL')}
+                          </span>
+                        </div>
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                          מפעיל (Actor): <code>{audit.actor}</code>
+                        </div>
+                        <div style={{ background: 'rgba(255,255,255,0.6)', border: '1px solid var(--border-color)', padding: '0.5rem', borderRadius: '4px', marginTop: '0.5rem', fontSize: '0.75rem', overflowX: 'auto' }}>
+                          <code>{JSON.stringify(audit.payload)}</code>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* 5. API & Webhook Simulation Center (ADMIN Role Only) */}
+        {activeMenu === 'simulator' && role === 'ADMIN' && (
           <div className="content-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
             <section className="glass-card">
               <h2 className="section-title">🛠️ סימולטור אירועי Webhooks מוואטסאפ (Flow B)</h2>
@@ -1042,7 +1259,7 @@ function App() {
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 {/* Simulator Option 1: Unsubscribe */}
-                <div style={{ padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                <div style={{ padding: '1rem', background: 'rgba(0,0,0,0.02)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                   <h3 style={{ fontSize: '1rem', color: 'var(--color-danger)', marginBottom: '0.5rem' }}>הסרת דיוור נכנסת (Opt-out Simulation)</h3>
                   <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
                     מסמלץ מצב בו משתמש הקצה השיב להודעה שקיבל ורשם "הסר". המערכת תקלוט זאת ב-Webhook ותבצע Opt-out מיידי.
@@ -1076,7 +1293,7 @@ function App() {
                 </div>
 
                 {/* Simulator Option 2: Status Webhooks info */}
-                <div style={{ padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                <div style={{ padding: '1rem', background: 'rgba(0,0,0,0.02)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                   <h3 style={{ fontSize: '1rem', color: 'var(--color-cyan)', marginBottom: '0.5rem' }}>סימולציית סטטוס שידור (Delivered / Read)</h3>
                   <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                     כדי לבדוק מסירה או קריאה של הודעות, עבור ללשונית "קמפיינים ושידורים", בחר את הקמפיין הרצוי, ולחץ על הלחצנים הייעודיים ליד כל מזהה הודעה ברשימה הצידית.
@@ -1085,15 +1302,15 @@ function App() {
               </div>
             </section>
 
-            {/* Audit Logs Trail view */}
+            {/* Audit Logs Trail view (Tenant Spacific logs) */}
             <section className="glass-card">
-              <h2 className="section-title">📜 יומן מעקב פעולות וביקורת (Audit Logs)</h2>
+              <h2 className="section-title">📜 יומן מעקב פעולות וביקורת לקוח ({activeClient?.name})</h2>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem', maxHeight: '450px', overflowY: 'auto' }}>
                 {audits.length === 0 ? (
                   <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'center', padding: '2rem 0' }}>טרם נרשמו פעולות במערכת.</p>
                 ) : (
                   audits.map(audit => (
-                    <div key={audit.id} style={{ padding: '0.75rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '0.8rem' }}>
+                    <div key={audit.id} style={{ padding: '0.75rem', background: 'rgba(0,0,0,0.02)', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '0.8rem' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold' }}>
                         <span style={{ color: 'var(--color-violet)' }}>{audit.action}</span>
                         <span style={{ color: 'var(--text-muted)' }}>{new Date(audit.timestamp).toLocaleTimeString()}</span>
@@ -1101,7 +1318,7 @@ function App() {
                       <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
                         מפעיל: <code>{audit.actor}</code>
                       </div>
-                      <div style={{ background: 'rgba(0,0,0,0.3)', padding: '0.35rem', borderRadius: '4px', marginTop: '0.35rem', fontSize: '0.75rem' }}>
+                      <div style={{ background: 'rgba(255,255,255,0.6)', padding: '0.35rem', borderRadius: '4px', marginTop: '0.35rem', fontSize: '0.75rem', border: '1px solid var(--border-color)' }}>
                         <code>{JSON.stringify(audit.payload)}</code>
                       </div>
                     </div>
@@ -1112,7 +1329,7 @@ function App() {
           </div>
         )}
 
-        {/* 5. User End-User View & WhatsApp Mobile Mockup Chat Simulator */}
+        {/* 6. User End-User View & WhatsApp Mobile Mockup Chat Simulator (Preference center / Simulator) */}
         {activeMenu === 'userView' && (
           <div className="content-grid" style={{ gridTemplateColumns: '1.2fr 1fr' }}>
             {/* Left Column: User Preference Portal Mockup */}
@@ -1154,7 +1371,7 @@ function App() {
                       </span>
                     </div>
 
-                    <div style={{ marginTop: 'auto', paddingTop: '1.5rem', borderTop: '1px solid var(--border-color)' }}>
+                    <div style={{ marginTop: 'auto', paddingTop: '1.5rem', borderTop: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                       <button 
                         className="btn" 
                         style={{
@@ -1294,7 +1511,7 @@ function App() {
         )}
       </main>
 
-      {/* 6. Drag & Drop CSV Importer Modal */}
+      {/* 7. Drag & Drop CSV Importer Modal */}
       {showUploadModal && activeClient && (
         <div style={{
           position: 'fixed',

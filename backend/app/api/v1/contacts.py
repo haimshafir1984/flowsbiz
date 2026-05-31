@@ -12,13 +12,26 @@ from app.core.models.contact import Contact
 from sqlalchemy import select, update
 import datetime
 
+from app.api.dependencies import client_or_admin_required
+from app.core.models.client import User, UserRole
+
 router = APIRouter()
 
 @router.get("/{client_id}")
-async def list_contacts(client_id: UUID, db: AsyncSession = Depends(get_db_session)):
+async def list_contacts(
+    client_id: UUID, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
+):
     """
-    Retrieve all registered contacts for a tenant.
+    Retrieve all registered contacts for a tenant. Ensures tenant isolation.
     """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot query other tenants' contacts."
+        )
+        
     stmt = select(ContactORM).where(ContactORM.client_id == client_id).order_by(ContactORM.created_at.desc())
     res = await db.execute(stmt)
     orms = res.scalars().all()
@@ -28,11 +41,18 @@ async def list_contacts(client_id: UUID, db: AsyncSession = Depends(get_db_sessi
 async def create_contact(
     client_id: UUID, 
     payload: ContactCreateSchema, 
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
 ):
     """
-    Register a new contact with custom parameters.
+    Register a new contact with custom parameters. Ensures tenant validation.
     """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot add contacts to another tenant's account."
+        )
+        
     # Clean check if number exists
     stmt = select(ContactORM).where(
         ContactORM.client_id == client_id, 
@@ -70,19 +90,31 @@ async def create_contact(
 async def toggle_opt_status(
     contact_id: UUID, 
     opt_status: str, 
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
 ):
     """
-    Manually toggle contact opt-in status.
+    Manually toggle contact opt-in status. Ensures client ownership verification.
     """
     if opt_status not in ("granted", "revoked"):
         raise HTTPException(status_code=400, detail="Invalid status option. Must be 'granted' or 'revoked'")
         
-    stmt = update(ContactORM).where(ContactORM.id == contact_id).values(
-        opt_in_status=opt_status, 
-        opt_in_date=datetime.datetime.utcnow()
-    )
-    await db.execute(stmt)
+    # Query contact first to verify client ownership
+    stmt_contact = select(ContactORM).where(ContactORM.id == contact_id)
+    res_contact = await db.execute(stmt_contact)
+    contact = res_contact.scalar_one_or_none()
+    
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found.")
+        
+    if current_user.role == UserRole.CLIENT and contact.client_id != current_user.client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: This contact belongs to another tenant account."
+        )
+        
+    contact.opt_in_status = opt_status
+    contact.opt_in_date = datetime.datetime.utcnow()
     await db.commit()
     return {"message": "Status updated successfully"}
 
@@ -90,12 +122,19 @@ async def toggle_opt_status(
 async def upload_contacts_csv(
     client_id: UUID,
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(client_or_admin_required)
 ):
     """
     Upload a CSV file containing contacts. Automatically sanitizes phone numbers
-    and maps extra columns to custom_attributes.
+    and maps extra columns to custom_attributes. Ensures tenant validation.
     """
+    if current_user.role == UserRole.CLIENT and current_user.client_id != client_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Cannot upload contacts for another tenant."
+        )
+        
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
         
